@@ -6,7 +6,7 @@ on:
         type: choice
         description: "分支"
         required: true
-        default: sm8550
+        default: sm8650
         options:
           - sm7550
           - sm7675
@@ -20,7 +20,7 @@ on:
         type: choice
         description: "配置文件"
         required: true
-        default: oneplus_ace2_pro_v
+        default: oneplus_ace5_b
         options:
           - oneplus_nord_ce4_v
           - oneplus_ace_3v_v
@@ -39,6 +39,7 @@ on:
           - oneplus_13r
           - oneplus_ace3_pro_v
           - oneplus_ace5
+          - oneplus_ace5_b
           - oneplus_pad2_v
           - oneplus_13
           - oneplus_13t
@@ -51,7 +52,7 @@ on:
         type: choice
         description: "处理器代号"
         required: true
-        default: kalama
+        default: pineapple
         options:
           - crow
           - waipio
@@ -63,7 +64,7 @@ on:
         type: choice
         description: "内核安卓版本"
         required: true
-        default: android15
+        default: android14
         options:
           - android12
           - android13
@@ -74,7 +75,7 @@ on:
        type: choice
        description: "内核版本"
        required: true
-       default: "5.15"
+       default: "6.1"
        options:
          - "5.10"
          - "5.15"
@@ -214,140 +215,12 @@ jobs:
           patch -p1 < 50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch || true
           echo "完成"
 
-      # 修复一加官方源码漂移导致 susfs 补丁 include 块插入失败的问题
-      - name: Fix rejected susfs include hunks
-        run: |
-          cd kernel_workspace/kernel_platform/common
-
-          if ! grep -q 'linux/susfs_def.h' fs/namespace.c; then
-            sed -i '/#include <linux\/mnt_idmapping.h>/a #ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n\n#define CL_COPY_MNT_NS BIT(25)\n#endif' fs/namespace.c
-          fi
-
-          if ! grep -q 'linux/susfs_def.h' fs/proc/task_mmu.c; then
-            sed -i '/#include <linux\/pkeys.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif' fs/proc/task_mmu.c
-          fi
-
-          if ! grep -q 'linux/susfs_def.h' mm/memory.c; then
-            sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux/susfs_def.h>\n#endif' mm/memory.c
-          fi
-
-          echo "include remediation result:"
-          grep -n 'susfs_def.h' fs/namespace.c fs/proc/task_mmu.c mm/memory.c
-
       - name: Apply Hide Stuff Patches
         run: |
           cd kernel_workspace/kernel_platform/common
           cp ../../SukiSU_patch/69_hide_stuff.patch ./
           echo "正在打隐藏应用补丁"
-          patch -p1 -F 3 < 69_hide_stuff.patch || true
-
-      # 69_hide_stuff.patch 与新版 susfs 结构不兼容，fuzz 会把 dentry 代码插进
-      # OPEN_REDIRECT 块里导致编译错误，这里按固定锚点重建 task_mmu.c 的改动
-      - name: Fix hide_stuff dentry placement
-        run: |
-          cd kernel_workspace/kernel_platform/common
-          python3 << 'PYEOF'
-          p = 'fs/proc/task_mmu.c'
-          lines = open(p).readlines()
-
-          def find(sub, start=0):
-              for i in range(start, len(lines)):
-                  if sub in lines[i]:
-                      return i
-              return -1
-
-          # 1) show_vma_header_prefix_fake 函数
-          if find('show_vma_header_prefix_fake') == -1:
-              anchor = find('show_map_vma(struct seq_file *m')
-              while anchor != -1 and 'static' not in lines[anchor - 1]:
-                  anchor -= 1
-              fake = [
-                  'static void show_vma_header_prefix_fake(struct seq_file *m,\n',
-                  '\t\t\t\t\tunsigned long start, unsigned long end,\n',
-                  '\t\t\t\t\tvm_flags_t flags, unsigned long long pgoff,\n',
-                  '\t\t\t\t\tdev_t dev, unsigned long ino)\n',
-                  '{\n',
-                  '\tseq_setwidth(m, 25 + sizeof(void *) * 6 - 1);\n',
-                  '\tseq_printf(m, "%08lx-%08lx %c%c%c%c %08llx %02x:%02x %lu ",\n',
-                  '\t\t\tstart,\n',
-                  '\t\t\tend,\n',
-                  "\t\t\tflags & VM_READ ? 'r' : '-',\n",
-                  "\t\t\tflags & VM_WRITE ? 'w' : '-',\n",
-                  "\t\t\tflags & VM_EXEC ? '-' : '-',\n",
-                  "\t\t\tflags & VM_MAYSHARE ? 's' : 'p',\n",
-                  '\t\t\tpgoff,\n',
-                  '\t\t\tMAJOR(dev), MINOR(dev), ino);\n',
-                  '}\n',
-                  '\n',
-              ]
-              lines[anchor - 1:anchor - 1] = fake
-              print('inserted show_vma_header_prefix_fake')
-
-          # 2) dentry 声明
-          if find('struct dentry *dentry;') == -1:
-              anchor = find('const char *name = NULL;')
-              if anchor != -1:
-                  lines.insert(anchor + 1, '\tstruct dentry *dentry;\n')
-                  print('inserted dentry declaration')
-
-          # 3) 删除所有（可能被 fuzz 放错位置的）dentry 赋值块
-          while True:
-              assign = find('dentry = file->f_path.dentry;')
-              if assign == -1:
-                  break
-              ifline = find('if (dentry) {', assign)
-              if ifline == -1:
-                  del lines[assign]
-                  continue
-              depth = 0
-              end = ifline
-              for i in range(ifline, len(lines)):
-                  depth += lines[i].count('{') - lines[i].count('}')
-                  if depth == 0:
-                      end = i
-                      break
-              del lines[assign:end + 1]
-              print('removed misplaced dentry block')
-
-          # 4) 在正确位置（SUS_KSTAT 块之后、if (file) 内）插入 dentry 块
-          kstat = find('susfs_sus_kstat_spoof_show_map_vma(inode')
-          endif = find('#endif', kstat)
-          block = [
-              '\t\tdentry = file->f_path.dentry;\n',
-              '\t\tif (dentry) {\n',
-              '\t\t\tconst char *path = (const char *)dentry->d_name.name;\n',
-              '\t\t\tif (strstr(path, "lineage")) {\n',
-              '\t\t\t\tstart = vma->vm_start;\n',
-              '\t\t\t\tend = vma->vm_end;\n',
-              '\t\t\t\tshow_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);\n',
-              '\t\t\t\tname = "/system/framework/framework-res.apk";\n',
-              '\t\t\t\tgoto done;\n',
-              '\t\t\t}\n',
-              '\t\t\tif (strstr(path, "jit-zygote-cache")) {\n',
-              '\t\t\t\tstart = vma->vm_start;\n',
-              '\t\t\t\tend = vma->vm_end;\n',
-              '\t\t\t\tshow_vma_header_prefix_fake(m, start, end, flags, pgoff, dev, ino);\n',
-              '\t\t\t\tgoto bypass;\n',
-              '\t\t\t}\n',
-              '\t\t}\n',
-          ]
-          lines[endif + 1:endif + 1] = block
-          print('inserted dentry block at correct position')
-
-          # 5) 确保 bypass 标签在 “Print the dentry name” 注释之前
-          comment = find('Print the dentry name')
-          func = find('show_map_vma(struct seq_file *m')
-          labels = [i for i in range(func, comment) if lines[i].strip() == 'bypass:']
-          if not labels:
-              # 删掉函数体内残留的错位 bypass 标签再插到正确位置
-              comment_line = comment - 1  # '/*' 行
-              lines.insert(comment_line, '\tbypass:\n')
-              print('inserted bypass label')
-
-          open(p, 'w').writelines(lines)
-          print('task_mmu.c hide_stuff remediation done')
-          PYEOF
-          grep -n "show_vma_header_prefix_fake\|struct dentry \*dentry\|dentry = file\|bypass:" fs/proc/task_mmu.c | head -12
+          patch -p1 -F 3 < 69_hide_stuff.patch
 
       - name: Apply LZ4KD
         run: |
