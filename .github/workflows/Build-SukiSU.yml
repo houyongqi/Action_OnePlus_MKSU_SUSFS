@@ -215,6 +215,130 @@ jobs:
           patch -p1 < 50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch || true
           echo "完成"
 
+      # 修复 susfs 补丁在 OnePlus 内核上丢失的 include/extern 声明
+      # 原因：一加内核的 fs/proc/base.c 没有 <linux/dma-buf.h>、fs/namespace.c 没有
+      #       <trace/hooks/blk.h>，补丁中“插入头文件/声明”的两个 hunk 因上下文不匹配被丢弃，
+      #       但使用这些宏的代码已打入 → 报 call to undeclared function 而中断编译。
+      - name: Fix susfs headers (base.c / namespace.c)
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          python3 - <<'PY'
+          import os, re, sys
+
+          BASE = "fs/proc/base.c"
+          NS   = "fs/namespace.c"
+
+          BASE_INC = """#if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+          #include <linux/susfs_def.h>
+          #endif // #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+          """
+
+          NS_INC = """#ifdef CONFIG_KSU_SUSFS
+          #include <linux/susfs_def.h>
+          #endif // #ifdef CONFIG_KSU_SUSFS
+          """
+
+          NS_DECL = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          extern bool susfs_is_current_ksu_domain(void);
+          extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+
+          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+          #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          """
+
+          log = []
+
+          def read(p):
+              with open(p, encoding="utf-8", errors="ignore") as f:
+                  return f.read()
+
+          def write(p, s):
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(s)
+
+          def insert_after(lines, pattern, block, label):
+              rx = re.compile(pattern)
+              for i, line in enumerate(lines):
+                  if rx.search(line):
+                      lines[i+1:i+1] = block.splitlines(True)
+                      log.append("  [OK] %s: 插入在 %r 之后" % (label, line.strip()))
+                      return True
+              return False
+
+          def insert_before(lines, pattern, block, label):
+              rx = re.compile(pattern)
+              for i, line in enumerate(lines):
+                  if rx.search(line):
+                      lines[i:i] = block.splitlines(True)
+                      log.append("  [OK] %s: 插入在 %r 之前" % (label, line.strip()))
+                      return True
+              return False
+
+          def fix_file(path, inc_block, inc_anchor, must_use):
+              if not os.path.exists(path):
+                  log.append("  [SKIP] %s 不存在" % path); return
+              src = read(path)
+              if "linux/susfs_def.h" in src:
+                  log.append("  [OK] %s 已包含 susfs_def.h，跳过" % path); return
+              if must_use not in src:
+                  log.append("  [SKIP] %s 未使用 %s，不需要插入" % (path, must_use)); return
+              lines = src.splitlines(True)
+              if not insert_after(lines, inc_anchor, inc_block + "\n", path):
+                  last = -1
+                  for i, l in enumerate(lines[:150]):
+                      if re.match(r"^\s*#include\s+[<\"]", l):
+                          last = i
+                  if last < 0:
+                      log.append("  [FAIL] %s 找不到插入位置" % path); return
+                  lines[last+1:last+1] = ["\n"]
+                  log.append("  [WARN] %s 未命中锚点，已插到 include 区块末尾" % path)
+              write(path, "".join(lines))
+
+          log.append("== 修复 susfs 头文件/声明 ==")
+          fix_file(BASE, BASE_INC, r"^#include\s+<linux/cpufreq_times\.h>", "SUSFS_IS_INODE_")
+          fix_file(NS,  NS_INC,   r"^#include\s+<linux/mnt_idmapping\.h>",   "susfs_is_current_ksu_domain")
+
+          if os.path.exists(NS):
+              src = read(NS)
+              if "extern bool susfs_is_current_ksu_domain" in src:
+                  log.append("  [OK] %s 已存在 extern 声明块，跳过" % NS)
+              elif "susfs_is_current_ksu_domain" in src:
+                  lines = src.splitlines(True)
+                  if insert_before(lines, r"^/\* Maximum number of mounts in a mount namespace \*/", NS_DECL + "\n", NS) or \
+                     insert_before(lines, r"^static unsigned int sysctl_mount_max", NS_DECL + "\n", NS):
+                      write(NS, "".join(lines))
+                  else:
+                      log.append("  [FAIL] %s 找不到声明块插入位置" % NS)
+
+          print("\n".join(log))
+
+          ok = True
+          for p, key in ((BASE, "linux/susfs_def.h"), (NS, "linux/susfs_def.h"),
+                         (NS, "CL_COPY_MNT_NS BIT(25)"),
+                         (NS, "extern bool susfs_is_current_ksu_domain")):
+              if os.path.exists(p) and key not in read(p):
+                  print("  [FAIL] %s 缺少 %s" % (p, key)); ok = False
+          print("== 自检%s ==" % ("通过" if ok else "未通过"))
+          sys.exit(0 if ok else 1)
+          PY
+
+      # 快速失败：补丁残留问题在编译前就暴露，不浪费一小时的构建
+      - name: Sanity check patched tree
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          echo "---- 剩余 reject 文件 ----"
+          find . -name '*.rej' -printf '%p\n' 2>/dev/null | tee /tmp/rejects.txt || find . -name '*.rej' 2>/dev/null | tee /tmp/rejects.txt
+          echo "---- 关键声明检查 ----"
+          fail=0
+          grep -q 'linux/susfs_def.h' fs/proc/base.c || { echo "!! fs/proc/base.c 缺少 susfs_def.h"; fail=1; }
+          grep -q 'linux/susfs_def.h' fs/namespace.c  || { echo "!! fs/namespace.c 缺少 susfs_def.h"; fail=1; }
+          grep -q 'CL_COPY_MNT_NS' fs/namespace.c     || { echo "!! fs/namespace.c 缺少 CL_COPY_MNT_NS 定义"; fail=1; }
+          if [ -s /tmp/rejects.txt ]; then
+            echo "!! 仍有未应用的补丁片段，内容如下（便于定位）："
+            for f in $(cat /tmp/rejects.txt); do echo "===== $f ====="; cat "$f"; done
+          fi
+          exit $fail
+
       - name: Apply Hide Stuff Patches (兼容性检查，不兼容则跳过)
         run: |
           cd kernel_workspace/kernel_platform/common
